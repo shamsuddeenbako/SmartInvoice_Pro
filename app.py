@@ -127,20 +127,32 @@ def generate_receipt(items, total):
 tab1, tab2 = st.tabs(["📝 New Sale", "📊 Manager Dashboard"])
 
 with tab1:
-    uploaded_file = st.file_uploader("Snap a picture", type=["jpg", "jpeg", "png"])
+    st.header("📝 New Sale")
     
-    if uploaded_file and st.button("Process Invoice"):
+    # 1. Choose Input Method
+    input_method = st.radio("Choose Input:", ["📸 Take Photo", "📂 Upload from Gallery"], horizontal=True)
+    
+    image_data = None
+    
+    if input_method == "📸 Take Photo":
+        # This opens the camera directly on Android
+        image_data = st.camera_input("Snap a picture of the list")
+    else:
+        # This opens the file picker
+        image_data = st.file_uploader("Select image", type=["jpg", "jpeg", "png"])
+    
+    # 2. Process the Image (if one exists)
+    if image_data and st.button("🚀 Process Invoice"):
         if not api_key:
-            st.error("Please enter API Key in sidebar or secrets.toml")
+            st.error("Please enter API Key in sidebar")
         else:
             with st.spinner('Processing...'):
                 try:
-                    img = Image.open(uploaded_file)
+                    img = Image.open(image_data) # Works for both Camera and Upload
                     
-                    # --- THIS IS THE FIX ---
-                    model_name = get_model() # We ask the system for the name
+                    # Call AI
+                    model_name = get_model()
                     model = genai.GenerativeModel(model_name)
-                    # -----------------------
                     
                     prompt = """
                     Extract shopping list from image. 
@@ -151,11 +163,12 @@ with tab1:
                     
                     match = re.search(r'\[.*\]', response.text, re.DOTALL)
                     if not match:
-                        st.error("Could not find list in image. Try again.")
+                        st.error("Could not read list. Try moving closer/better light.")
                         st.stop()
                         
                     raw = json.loads(match.group(0))
                     
+                    # Calculate Logic
                     final_total = 0
                     clean_items = []
                     names = []
@@ -165,7 +178,6 @@ with tab1:
                         qty = row.get('qty', 1)
                         price = 0
                         
-                        # Price Match
                         if name in product_db:
                             price = product_db[name]
                         else:
@@ -196,10 +208,7 @@ with tab1:
                         st.download_button("Download Receipt", buf.getvalue(), "receipt.jpg", "image/jpeg")
                         
                 except Exception as e:
-                    if "429" in str(e):
-                        st.warning("🚦 Speed Limit Hit. Wait 30 seconds.")
-                    else:
-                        st.error(f"Error: {e}")
+                    st.error(f"Error: {e}")
 
 with tab2:
     st.header("Sales History")
