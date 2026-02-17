@@ -11,77 +11,66 @@ import pandas as pd
 # 1. SETUP PAGE
 st.set_page_config(page_title="Alh Jibrin Store Pro", page_icon="🛒", layout="wide")
 
-# 2. AUTOMATIC API KEY LOADING
+# 2. SESSION STATE INITIALIZATION (To remember data while editing)
+if 'scanned_df' not in st.session_state:
+    st.session_state.scanned_df = None
+if 'grand_total' not in st.session_state:
+    st.session_state.grand_total = 0
+
+# 3. AUTOMATIC API KEY & DATABASE LOADING
 try:
-    api_key = st.secrets["GOOGLE_API_KEY"]
-    os.environ["GOOGLE_API_KEY"] = api_key
-    genai.configure(api_key=api_key)
-    api_status = "✅ Connected"
+    # Try loading from secrets (Cloud) or environment (Local)
+    if "GOOGLE_API_KEY" in st.secrets:
+        os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+    
+    # If key is set, configure it
+    if os.environ.get("GOOGLE_API_KEY"):
+        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+        api_status = "✅ Connected"
+    else:
+        api_status = "⚠️ Missing Key"
 except:
-    # Fallback if secrets are not set (e.g. running locally without secrets.toml)
-    api_key = None
-    api_status = "⚠️ Key Missing"
+    api_status = "⚠️ Missing Key"
 
-# 3. SALES HISTORY LOGIC
-SALES_FILE = "sales_history.csv"
+# Load Products (The Database)
+PRODUCT_FILE = "products.csv"
 
-def load_sales():
-    if os.path.exists(SALES_FILE):
-        return pd.read_csv(SALES_FILE)
-    return pd.DataFrame(columns=["Date", "Time", "Items", "Total"])
+def load_products():
+    try:
+        df = pd.read_csv(PRODUCT_FILE)
+        # Ensure prices are numbers
+        if df['Sale Price'].dtype == 'O':
+            df['Sale Price'] = df['Sale Price'].astype(str).str.replace(',', '').astype(float)
+        return df
+    except:
+        return pd.DataFrame(columns=["Item Description", "Sale Price"])
 
-def save_sale(items_str, total):
-    df = load_sales()
-    new_data = {
-        "Date": datetime.datetime.now().strftime("%Y-%m-%d"),
-        "Time": datetime.datetime.now().strftime("%H:%M:%S"),
-        "Items": items_str,
-        "Total": total
-    }
-    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
-    df.to_csv(SALES_FILE, index=False)
+def save_products(df):
+    df.to_csv(PRODUCT_FILE, index=False)
 
-# 4. HELPER: FIND THE CORRECT MODEL NAME
+# Load the database into memory
+df_inventory = load_products()
+# Create a quick lookup dictionary: {'sugar': 1500}
+product_db = {}
+if not df_inventory.empty:
+    # Clean string data for matching
+    keys = df_inventory['Item Description'].astype(str).str.lower().str.strip()
+    values = df_inventory['Sale Price']
+    product_db = dict(zip(keys, values))
+
+# 4. HELPER FUNCTIONS
 def get_model():
-    """Dynamically finds the best available Gemini Flash model"""
     try:
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Look for any model with 'flash' in the name
-        flash_models = [m for m in models if 'flash' in m.lower()]
-        if flash_models:
-            return flash_models[0] # Return the first one found (e.g. models/gemini-1.5-flash-latest)
-        return models[0] # Fallback to whatever is available
-    except Exception as e:
-        st.error(f"Error finding models: {e}")
-        return "gemini-pro" # Emergency fallback
-
-# 5. SIDEBAR
-with st.sidebar:
-    st.title("Store Controls")
-    st.write(f"API Status: {api_status}")
-    
-    # If key is missing from secrets, allow manual entry
-    if not api_key:
-        api_key = st.text_input("Enter Google API Key", type="password")
-        if api_key:
-            os.environ["GOOGLE_API_KEY"] = api_key
-            genai.configure(api_key=api_key)
-    
-    # Load Products
-    try:
-        df_prod = pd.read_csv("products.csv")
-        df_prod['Item Description'] = df_prod['Item Description'].astype(str).str.lower().str.strip()
-        if df_prod['Sale Price'].dtype == 'O':
-             df_prod['Sale Price'] = df_prod['Sale Price'].astype(str).str.replace(',', '').astype(float)
-        
-        product_db = dict(zip(df_prod['Item Description'], df_prod['Sale Price']))
-        st.success(f"📦 Inventory: {len(product_db)} Items")
+        flash = [m for m in models if 'flash' in m.lower()]
+        return flash[0] if flash else models[0]
     except:
-        st.warning("⚠️ products.csv not found. Using AI prices.")
-        product_db = {}
+        return "models/gemini-1.5-flash"
 
-# 6. RECEIPT GENERATOR
-def generate_receipt(items, total):
+def generate_receipt_image(dataframe, total):
+    # Convert dataframe to list of dicts for drawing
+    items = dataframe.to_dict('records')
+    
     width, height = 500, 350 + (len(items) * 50)
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
@@ -107,9 +96,15 @@ def generate_receipt(items, total):
     y += 40
 
     for i in items:
-        name = i['item'][:18]
-        qty = str(i['qty'])
-        price = f"N{i['line_total']:,}"
+        name = str(i['Item'])[:18]
+        qty = str(i['Qty'])
+        # Handle price formatting safely
+        try:
+            line_val = float(i['Total'])
+            price = f"N{line_val:,.0f}"
+        except:
+            price = "N0"
+            
         draw.text((30, y), qty, font=font_b, fill="black")
         draw.text((100, y), name, font=font_b, fill="black")
         draw.text((380, y), price, font=font_b, fill="black")
@@ -118,104 +113,150 @@ def generate_receipt(items, total):
     draw.line([(20, y+10), (width-20, y+10)], fill="black", width=2)
     y += 30
     draw.text((30, y), "TOTAL:", font=font_bd, fill="black")
-    draw.text((380, y), f"N{total:,}", font=font_bd, fill="black")
+    draw.text((380, y), f"N{total:,.0f}", font=font_bd, fill="black")
     y += 60
     draw.text((width//2, y), "Thank You!", font=font_b, fill="black", anchor="mm")
     return img
 
-# 7. MAIN TABS
-tab1, tab2 = st.tabs(["📝 New Sale", "📊 Manager Dashboard"])
+# 5. MAIN NAVIGATION
+st.sidebar.title("Store Controls")
+st.sidebar.info(f"API: {api_status}")
+st.sidebar.info(f"📦 Items Loaded: {len(product_db)}")
 
+tab1, tab2 = st.tabs(["📝 New Sale (Scan & Edit)", "🏷️ Manage Prices"])
+
+# --- TAB 1: SCAN AND EDIT ---
 with tab1:
-    st.header("📝 New Sale")
+    st.header("New Sale")
     
-    # 1. Choose Input Method
-    input_method = st.radio("Choose Input:", ["📸 Take Photo", "📂 Upload from Gallery"], horizontal=True)
-    
-    image_data = None
-    
-    if input_method == "📸 Take Photo":
-        # This opens the camera directly on Android
-        image_data = st.camera_input("Snap a picture of the list")
-    else:
-        # This opens the file picker
-        image_data = st.file_uploader("Select image", type=["jpg", "jpeg", "png"])
-    
-    # 2. Process the Image (if one exists)
-    if image_data and st.button("🚀 Process Invoice"):
-        if not api_key:
-            st.error("Please enter API Key in sidebar")
+    # INPUT SECTION
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        input_method = st.radio("Input:", ["📸 Camera", "📂 File Upload"], horizontal=True)
+        if input_method == "📸 Camera":
+            image_file = st.camera_input("Take photo")
         else:
-            with st.spinner('Processing...'):
-                try:
-                    img = Image.open(image_data) # Works for both Camera and Upload
-                    
-                    # Call AI
-                    model_name = get_model()
-                    model = genai.GenerativeModel(model_name)
-                    
-                    prompt = """
-                    Extract shopping list from image. 
-                    Fix spelling (e.g. 'Semov' -> 'Semovita'). 
-                    Return JSON: [{"qty":1, "item":"Milk"}]
-                    """
-                    response = model.generate_content([prompt, img])
-                    
-                    match = re.search(r'\[.*\]', response.text, re.DOTALL)
-                    if not match:
-                        st.error("Could not read list. Try moving closer/better light.")
-                        st.stop()
-                        
-                    raw = json.loads(match.group(0))
-                    
-                    # Calculate Logic
-                    final_total = 0
-                    clean_items = []
-                    names = []
-                    
-                    for row in raw:
-                        name = row.get('item', '').lower().strip()
-                        qty = row.get('qty', 1)
-                        price = 0
-                        
-                        if name in product_db:
-                            price = product_db[name]
-                        else:
-                            for db_n, db_p in product_db.items():
-                                if name in db_n or db_n in name:
-                                    price = db_p
-                                    row['item'] = db_n.title()
-                                    break
-                        
-                        total = qty * price
-                        final_total += total
-                        clean_items.append({"qty":qty, "item":row['item'].title(), "line_total":total})
-                        names.append(row['item'])
-                        
-                    # Save & Show
-                    save_sale(", ".join(names), final_total)
-                    
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.table(clean_items)
-                        st.metric("Total", f"N{final_total:,}")
-                    with c2:
-                        rec_img = generate_receipt(clean_items, final_total)
-                        st.image(rec_img, width=300)
-                        
-                        buf = io.BytesIO()
-                        rec_img.save(buf, format="JPEG")
-                        st.download_button("Download Receipt", buf.getvalue(), "receipt.jpg", "image/jpeg")
-                        
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            image_file = st.file_uploader("Upload image", type=['jpg','png','jpeg'])
 
+    # PROCESS BUTTON
+    if image_file is not None:
+        if st.button("🚀 Scan Invoice"):
+            if not os.environ.get("GOOGLE_API_KEY"):
+                st.error("Please set API Key in secrets or sidebar.")
+            else:
+                with st.spinner("AI is reading & checking prices..."):
+                    try:
+                        img = Image.open(image_file)
+                        model = genai.GenerativeModel(get_model())
+                        prompt = """
+                        Extract shopping list. Fix spelling. 
+                        Return JSON: [{"qty":1, "item":"Milk"}]
+                        """
+                        response = model.generate_content([prompt, img])
+                        match = re.search(r'\[.*\]', response.text, re.DOTALL)
+                        
+                        if match:
+                            raw_data = json.loads(match.group(0))
+                            
+                            # Build the Data for the Editor
+                            processed_data = []
+                            for row in raw_data:
+                                name = row.get('item', '').strip().title()
+                                search_name = name.lower()
+                                qty = int(row.get('qty', 1))
+                                
+                                # Price Lookup Logic
+                                unit_price = 0
+                                if search_name in product_db:
+                                    unit_price = product_db[search_name]
+                                else:
+                                    # Fuzzy match
+                                    for db_n, db_p in product_db.items():
+                                        if search_name in db_n or db_n in search_name:
+                                            unit_price = db_p
+                                            name = db_n.title() # Auto-correct name
+                                            break
+                                
+                                total = qty * unit_price
+                                processed_data.append({
+                                    "Qty": qty,
+                                    "Item": name,
+                                    "Unit Price": unit_price,
+                                    "Total": total
+                                })
+                            
+                            # SAVE TO SESSION STATE (So it doesn't disappear)
+                            st.session_state.scanned_df = pd.DataFrame(processed_data)
+                            
+                        else:
+                            st.error("AI couldn't see a list. Try again.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+    # EDITING SECTION (Only shows if we have scanned data)
+    if st.session_state.scanned_df is not None:
+        st.divider()
+        st.subheader("✏️ Review & Edit Before Printing")
+        
+        # 1. THE DATA EDITOR (Excel-style editing)
+        edited_df = st.data_editor(
+            st.session_state.scanned_df,
+            num_rows="dynamic", # Allow adding/deleting rows
+            use_container_width=True,
+            key="editor" # Unique key
+        )
+        
+        # 2. RE-CALCULATE TOTAL INSTANTLY
+        # We recalculate total based on user edits (Qty * Unit Price)
+        edited_df["Total"] = edited_df["Qty"] * edited_df["Unit Price"]
+        final_total = edited_df["Total"].sum()
+        
+        st.metric("Grand Total", f"₦{final_total:,.0f}")
+        
+        # 3. GENERATE FINAL RECEIPT
+        if st.button("✅ Confirm & Print Receipt"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.success("Invoice Generated!")
+                # Here you would save to sales_history.csv if you want
+            
+            with col_b:
+                receipt_img = generate_receipt_image(edited_df, final_total)
+                st.image(receipt_img, caption="Final Receipt")
+                
+                # Download
+                buf = io.BytesIO()
+                receipt_img.save(buf, format="JPEG")
+                st.download_button(
+                    "📥 Download Image",
+                    data=buf.getvalue(),
+                    file_name=f"receipt_{datetime.datetime.now().strftime('%H%M%S')}.jpg",
+                    mime="image/jpeg"
+                )
+            
+            # Button to clear and start over
+            if st.button("Start New Sale"):
+                st.session_state.scanned_df = None
+                st.rerun()
+
+# --- TAB 2: PRICE MANAGER ---
 with tab2:
-    st.header("Sales History")
-    df = load_sales()
-    if not df.empty:
-        st.metric("Total Revenue", f"N{df['Total'].sum():,}")
-        st.dataframe(df, use_container_width=True)
-        st.download_button("Download Excel Report", df.to_csv(index=False), "report.csv")
-    else:
-        st.info("No sales yet.")
+    st.header("🏷️ Inventory Manager")
+    st.warning("Note: If using Streamlit Cloud (Free), these changes reset when the app restarts. On Local Laptop, they are permanent.")
+    
+    # Load current CSV
+    df_editor = load_products()
+    
+    # Show editable table
+    updated_df = st.data_editor(
+        df_editor,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+    
+    # Save Button
+    if st.button("💾 Save Changes to Database"):
+        save_products(updated_df)
+        st.success("Database Updated! Restarting app to apply changes...")
+        st.cache_data.clear() # Clear cache so new prices load
+        st.rerun()
